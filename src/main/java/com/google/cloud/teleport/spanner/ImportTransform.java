@@ -45,6 +45,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 import org.apache.avro.Schema;
 import org.apache.avro.file.DataFileConstants;
 import org.apache.avro.io.BinaryDecoder;
@@ -67,9 +68,11 @@ import org.apache.beam.sdk.transforms.Combine;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.Flatten;
+import org.apache.beam.sdk.transforms.InferableFunction;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.SimpleFunction;
 import org.apache.beam.sdk.transforms.View;
 import org.apache.beam.sdk.transforms.Wait;
 import org.apache.beam.sdk.values.KV;
@@ -102,24 +105,28 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
   private final ValueProvider<Boolean> waitForIndexes;
   private final ValueProvider<Boolean> waitForForeignKeys;
   private final ValueProvider<Boolean> earlyIndexCreateFlag;
+  private final ValueProvider<List<String>> tableList;
 
   public ImportTransform(
       SpannerConfig spannerConfig,
       ValueProvider<String> importDirectory,
       ValueProvider<Boolean> waitForIndexes,
       ValueProvider<Boolean> waitForForeignKeys,
-      ValueProvider<Boolean> earlyIndexCreateFlag) {
+      ValueProvider<Boolean> earlyIndexCreateFlag,
+      ValueProvider<List<String>> tableList) {
     this.spannerConfig = spannerConfig;
     this.importDirectory = importDirectory;
     this.waitForIndexes = waitForIndexes;
     this.waitForForeignKeys = waitForForeignKeys;
     this.earlyIndexCreateFlag = earlyIndexCreateFlag;
+    this.tableList = tableList;
   }
 
   @Override
   public PDone expand(PBegin begin) {
     PCollection<Export> manifest =
-        begin.apply("Read manifest", new ReadExportManifestFile(importDirectory));
+        begin.apply("Read manifest", new ReadExportManifestFile(importDirectory, tableList));
+
     PCollectionView<Export> manifestView =
         manifest.apply("Manifest as view", View.asSingleton());
 
@@ -258,9 +265,12 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
   private static class ReadExportManifestFile extends PTransform<PBegin, PCollection<Export>> {
 
     private final ValueProvider<String> importDirectory;
+    private final ValueProvider<List<String>> tableList;
 
-    private ReadExportManifestFile(ValueProvider<String> importDirectory) {
+    private ReadExportManifestFile(ValueProvider<String> importDirectory,
+        ValueProvider<List<String>> tableList) {
       this.importDirectory = importDirectory;
+      this.tableList = tableList;
     }
 
     @Override
@@ -276,7 +286,21 @@ public class ImportTransform extends PTransform<PBegin, PDone> {
           .apply(
               "Read manifest json",
               MapElements.into(TypeDescriptor.of(Export.class))
-                  .via(ReadExportManifestFile::readManifest));
+                  .via(ReadExportManifestFile::readManifest))
+          .apply("Filter tables", MapElements.via(new SimpleFunction<Export, Export>() {
+            @Override
+            public Export apply(Export input) {
+              if(tableList.get() == null || tableList.get().isEmpty()){
+                return input;
+              }
+              Export.Builder filtered = input.toBuilder();
+              Set<String> tableFilter = tableList.get().stream().map(String::toLowerCase).collect(
+                  Collectors.toSet());
+              filtered.clearTables();
+              input.getTablesList().stream().filter(t -> tableFilter.contains(t.getName().toLowerCase())).forEach(t -> filtered.addTables(t));
+              return filtered.build();
+            }
+          }));
     }
 
     private static Export readManifest(ResourceId fileResource) {

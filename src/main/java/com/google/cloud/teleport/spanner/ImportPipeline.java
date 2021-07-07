@@ -16,6 +16,7 @@
 
 package com.google.cloud.teleport.spanner;
 
+import java.util.List;
 import org.apache.beam.runners.dataflow.options.DataflowPipelineOptions;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineResult;
@@ -86,6 +87,10 @@ public class ImportPipeline {
     @Description("GCP Project Id of where the Spanner table lives.")
     ValueProvider<String> getSpannerProjectId();
 
+    @Description("Comma-separated list of table names to import (leave empty to import all)")
+    ValueProvider<List<String>> getTableList();
+    void setTableList(ValueProvider<List<String>> value);
+
     void setSpannerProjectId(ValueProvider<String> value);
 
     void setWaitUntilFinish(boolean value);
@@ -110,7 +115,8 @@ public class ImportPipeline {
             options.getInputDir(),
             options.getWaitForIndexes(),
             options.getWaitForForeignKeys(),
-            options.getEarlyIndexCreateFlag()));
+            options.getEarlyIndexCreateFlag(),
+            options.getTableList()));
 
     PipelineResult result = p.run();
     if (options.getWaitUntilFinish() &&

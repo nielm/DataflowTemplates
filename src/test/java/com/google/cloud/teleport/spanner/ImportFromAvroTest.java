@@ -438,7 +438,8 @@ public class ImportFromAvroTest {
             ValueProvider.StaticValueProvider.of(manifestFileLocation),
             ValueProvider.StaticValueProvider.of(true),
             ValueProvider.StaticValueProvider.of(true),
-            ValueProvider.StaticValueProvider.of(true)));
+            ValueProvider.StaticValueProvider.of(true),
+            ValueProvider.StaticValueProvider.of(Collections.emptyList())));
     PipelineResult importResult = importPipeline.run();
     importResult.waitUntilFinish();
 
