@@ -22,22 +22,34 @@ import com.google.cloud.spanner.Statement;
 import com.google.cloud.teleport.spanner.ExportProtos.Export;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
+import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
 import org.apache.beam.sdk.values.KV;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** Scans INFORMATION_SCHEMA.* tables and build {@link Ddl}. */
+/**
+ * Scans INFORMATION_SCHEMA.* tables and build {@link Ddl}.
+ */
 public class InformationSchemaScanner {
 
   private static final Logger LOG = LoggerFactory.getLogger(InformationSchemaScanner.class);
 
   private final ReadContext context;
+  private final ImmutableSet<String> tableFilter;
+
+  public InformationSchemaScanner(ReadContext context, List<String> tableFilter) {
+    this.context = context;
+    this.tableFilter = tableFilter.stream().map(String::toLowerCase)
+        .collect(ImmutableSet.toImmutableSet());
+  }
 
   public InformationSchemaScanner(ReadContext context) {
     this.context = context;
+    this.tableFilter = ImmutableSet.of();
   }
 
   public Ddl scan() {
@@ -88,13 +100,20 @@ public class InformationSchemaScanner {
     return builder.build();
   }
 
+  private boolean isInTableFilter(String tableName) {
+    if (tableFilter.isEmpty()) {
+      return true;
+    }
+    return tableFilter.contains(tableName.toLowerCase());
+  }
+
   private void listDatabaseOptions(Ddl.Builder builder) {
     ResultSet resultSet =
         context.executeQuery(
             Statement.newBuilder(
                 "SELECT t.option_name, t.option_type, t.option_value "
-                + " FROM information_schema.database_options AS t "
-                + " WHERE t.catalog_name = '' AND t.schema_name = ''")
+                    + " FROM information_schema.database_options AS t "
+                    + " WHERE t.catalog_name = '' AND t.schema_name = ''")
                 .build());
 
     ImmutableList.Builder<Export.DatabaseOption> options = ImmutableList.builder();
@@ -143,13 +162,22 @@ public class InformationSchemaScanner {
           throw new IllegalStateException("Unsupported on delete action " + onDeleteAction);
         }
       }
-      LOG.debug(
-          "Schema Table {} Parent {} OnDelete {} {}", tableName, parentTableName, onDeleteCascade);
-      builder
-          .createTable(tableName)
-          .interleaveInParent(parentTableName)
-          .onDeleteCascade(onDeleteCascade)
-          .endTable();
+
+      if (isInTableFilter(tableName)) {
+        if (parentTableName != null && !isInTableFilter(parentTableName)) {
+          // Parent table not in filter -- re-parent to root
+          parentTableName = null;
+        }
+
+        LOG.debug(
+            "Schema Table {} Parent {} OnDelete {}", tableName, parentTableName, onDeleteCascade);
+
+        builder
+            .createTable(tableName)
+            .interleaveInParent(parentTableName)
+            .onDeleteCascade(onDeleteCascade)
+            .endTable();
+      }
     }
   }
 
@@ -175,16 +203,18 @@ public class InformationSchemaScanner {
       boolean isStored = resultSet.isNull(7)
           ?
           false : resultSet.getString(7).equalsIgnoreCase("YES");
-      builder
-          .createTable(tableName)
-          .column(columnName)
-          .parseType(spannerType)
-          .notNull(!nullable)
-          .isGenerated(isGenerated)
-          .generationExpression(generationExpression)
-          .isStored(isStored)
-          .endColumn()
-          .endTable();
+      if (isInTableFilter(tableName)) {
+        builder
+            .createTable(tableName)
+            .column(columnName)
+            .parseType(spannerType)
+            .notNull(!nullable)
+            .isGenerated(isGenerated)
+            .generationExpression(generationExpression)
+            .isStored(isStored)
+            .endColumn()
+            .endTable();
+      }
     }
   }
 
@@ -209,17 +239,23 @@ public class InformationSchemaScanner {
       boolean unique = resultSet.getBoolean(3);
       boolean nullFiltered = resultSet.getBoolean(4);
 
-      Map<String, Index.Builder> tableIndexes =
-          indexes.computeIfAbsent(tableName, k -> Maps.newTreeMap());
+      if (isInTableFilter(tableName)) {
+        if (parent != null && !isInTableFilter(parent)) {
+          // Parent table not in filter, re-parent index to root
+          parent = null;
+        }
+        Map<String, Index.Builder> tableIndexes =
+            indexes.computeIfAbsent(tableName, k -> Maps.newTreeMap());
 
-      tableIndexes.put(
-          indexName,
-          Index.builder()
-              .name(indexName)
-              .table(tableName)
-              .unique(unique)
-              .nullFiltered(nullFiltered)
-              .interleaveIn(parent));
+        tableIndexes.put(
+            indexName,
+            Index.builder()
+                .name(indexName)
+                .table(tableName)
+                .unique(unique)
+                .nullFiltered(nullFiltered)
+                .interleaveIn(parent));
+      }
     }
   }
 
@@ -238,30 +274,32 @@ public class InformationSchemaScanner {
       String ordering = resultSet.isNull(2) ? null : resultSet.getString(2);
       String indexName = resultSet.getString(3);
 
-      if (indexName.equals("PRIMARY_KEY")) {
-        IndexColumn.IndexColumnsBuilder<Table.Builder> pkBuilder =
-            builder.createTable(tableName).primaryKey();
-        if (ordering.equalsIgnoreCase("ASC")) {
-          pkBuilder.asc(columnName).end();
+      if (isInTableFilter(tableName)) {
+        if (indexName.equals("PRIMARY_KEY")) {
+          IndexColumn.IndexColumnsBuilder<Table.Builder> pkBuilder =
+              builder.createTable(tableName).primaryKey();
+          if (ordering.equalsIgnoreCase("ASC")) {
+            pkBuilder.asc(columnName).end();
+          } else {
+            pkBuilder.desc(columnName).end();
+          }
+          pkBuilder.end().endTable();
         } else {
-          pkBuilder.desc(columnName).end();
-        }
-        pkBuilder.end().endTable();
-      } else {
-        Map<String, Index.Builder> tableIndexes = indexes.get(tableName);
-        if (tableIndexes == null) {
-          continue;
-        }
-        Index.Builder indexBuilder = tableIndexes.get(indexName);
-        if (indexBuilder == null) {
-          continue;
-        }
-        if (ordering == null) {
-          indexBuilder.columns().storing(columnName).end();
-        } else if (ordering.equalsIgnoreCase("ASC")) {
-          indexBuilder.columns().asc(columnName).end();
-        } else if (ordering.equalsIgnoreCase("DESC")) {
-          indexBuilder.columns().desc(columnName).end();
+          Map<String, Index.Builder> tableIndexes = indexes.get(tableName);
+          if (tableIndexes == null) {
+            continue;
+          }
+          Index.Builder indexBuilder = tableIndexes.get(indexName);
+          if (indexBuilder == null) {
+            continue;
+          }
+          if (ordering == null) {
+            indexBuilder.columns().storing(columnName).end();
+          } else if (ordering.equalsIgnoreCase("ASC")) {
+            indexBuilder.columns().asc(columnName).end();
+          } else if (ordering.equalsIgnoreCase("DESC")) {
+            indexBuilder.columns().desc(columnName).end();
+          }
         }
       }
     }
@@ -300,12 +338,14 @@ public class InformationSchemaScanner {
       String tableName = entry.getKey().getKey();
       String columnName = entry.getKey().getValue();
       ImmutableList<String> options = entry.getValue().build();
-      builder
-          .createTable(tableName)
-          .column(columnName)
-          .columnOptions(options)
-          .endColumn()
-          .endTable();
+      if (isInTableFilter(tableName)) {
+        builder
+            .createTable(tableName)
+            .column(columnName)
+            .columnOptions(options)
+            .endColumn()
+            .endTable();
+      }
     }
   }
 
@@ -341,15 +381,18 @@ public class InformationSchemaScanner {
       String column = resultSet.getString(2);
       String referencedTable = resultSet.getString(3);
       String referencedColumn = resultSet.getString(4);
-      Map<String, ForeignKey.Builder> tableForeignKeys =
-          foreignKeys.computeIfAbsent(table, k -> Maps.newTreeMap());
-      ForeignKey.Builder foreignKey =
-          tableForeignKeys.computeIfAbsent(
-              name,
-              k -> ForeignKey.builder().name(name).table(table).referencedTable(referencedTable));
-      foreignKey.columnsBuilder().add(column);
-      foreignKey.referencedColumnsBuilder().add(referencedColumn);
-    }
+
+      if (isInTableFilter(table) && isInTableFilter(referencedTable)) {
+
+        Map<String, ForeignKey.Builder> tableForeignKeys =
+            foreignKeys.computeIfAbsent(table, k -> Maps.newTreeMap());
+        ForeignKey.Builder foreignKey =
+            tableForeignKeys.computeIfAbsent(
+                name,
+                k -> ForeignKey.builder().name(name).table(table).referencedTable(referencedTable));
+        foreignKey.columnsBuilder().add(column);
+        foreignKey.referencedColumnsBuilder().add(referencedColumn);
+      }}
   }
 
   private Map<String, NavigableMap<String, CheckConstraint>> listCheckConstraints() {
@@ -376,10 +419,13 @@ public class InformationSchemaScanner {
       String table = resultSet.getString(0);
       String name = resultSet.getString(1);
       String expression = resultSet.getString(2);
-      Map<String, CheckConstraint> tableCheckConstraints =
-          checkConstraints.computeIfAbsent(table, k -> Maps.newTreeMap());
-      tableCheckConstraints.computeIfAbsent(
-          name, k -> CheckConstraint.builder().name(name).expression(expression).build());
+
+      if (isInTableFilter(table)) {
+        Map<String, CheckConstraint> tableCheckConstraints =
+            checkConstraints.computeIfAbsent(table, k -> Maps.newTreeMap());
+        tableCheckConstraints.computeIfAbsent(
+            name, k -> CheckConstraint.builder().name(name).expression(expression).build());
+      }
     }
     return checkConstraints;
   }

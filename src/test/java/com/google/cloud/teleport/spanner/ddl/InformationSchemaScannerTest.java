@@ -16,9 +16,13 @@
 
 package com.google.cloud.teleport.spanner.ddl;
 
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.containsStringIgnoringCase;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.text.IsEqualCompressingWhiteSpace.equalToCompressingWhiteSpace;
@@ -31,6 +35,7 @@ import com.google.cloud.teleport.spanner.IntegrationTest;
 import com.google.cloud.teleport.spanner.SpannerServerResource;
 import com.google.cloud.teleport.spanner.common.Type;
 import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -50,7 +55,8 @@ public class InformationSchemaScannerTest {
 
   private final String dbId = "informationschemascannertest";
 
-  @Rule public final SpannerServerResource spannerServer = new SpannerServerResource();
+  @Rule
+  public final SpannerServerResource spannerServer = new SpannerServerResource();
 
   @Before
   public void setup() {
@@ -64,11 +70,14 @@ public class InformationSchemaScannerTest {
   }
 
   private Ddl getDatabaseDdl() {
+    return new InformationSchemaScanner(getTransaction()).scan();
+  }
+
+  private BatchReadOnlyTransaction getTransaction() {
     BatchClient batchClient = spannerServer.getBatchClient(dbId);
     BatchReadOnlyTransaction batchTx =
         batchClient.batchReadOnlyTransaction(TimestampBound.strong());
-    InformationSchemaScanner scanner = new InformationSchemaScanner(batchTx);
-    return scanner.scan();
+    return batchTx;
   }
 
   @Test
@@ -303,7 +312,7 @@ public class InformationSchemaScannerTest {
   // TODO: enable this test once generated columns are supported.
   // @Test
   public void generatedColumns() throws Exception {
-        String statement =
+    String statement =
         "CREATE TABLE `T` ("
             + " `id`                                     INT64 NOT NULL,"
             + " `generated`                              INT64 NOT NULL AS (`id`) STORED, "
@@ -335,5 +344,147 @@ public class InformationSchemaScannerTest {
     String alterStatement = statements.get(0);
     statements.set(0, alterStatement.replace(dbId, "%db_name%"));
     assertThat(ddl.prettyPrint(), equalToCompressingWhiteSpace(String.join("", statements)));
+  }
+
+  @Test
+  public void tableFilterBasic() throws Exception {
+    List<String> statements =
+        Arrays.asList(
+            " CREATE TABLE `Table0` ("
+                + " `id0`                                   INT64 NOT NULL,"
+                + " `val0`                                  STRING(MAX),"
+                + " ) PRIMARY KEY (`id0` ASC)",
+            " CREATE TABLE `Table1` ("
+                + " `id0`                                   INT64 NOT NULL,"
+                + " `val0`                                  STRING(MAX),"
+                + " ) PRIMARY KEY (`id0` ASC)",
+            " CREATE TABLE `TaBle2` ("
+                + " `id0`                                   INT64 NOT NULL,"
+                + " `val0`                                  STRING(MAX),"
+                + " ) PRIMARY KEY (`id0` ASC)");
+
+    spannerServer.createDatabase(dbId, statements);
+    Ddl ddl = new InformationSchemaScanner(getTransaction(), ImmutableList.of("Table1", "Table2"))
+        .scan();
+    assertThat(ddl.allTables(), hasSize(2));
+    assertThat(ddl.table("table1"), notNullValue());
+    assertThat(ddl.table("tAbLe2"), notNullValue());
+    assertThat(ddl.table("tAbLe0"), nullValue());
+
+    ddl = new InformationSchemaScanner(getTransaction(), ImmutableList.of()).scan();
+    assertThat(ddl.allTables(), hasSize(3));
+    assertThat(ddl.prettyPrint(), equalToCompressingWhiteSpace(String.join("", statements)));
+
+    ddl = new InformationSchemaScanner(getTransaction(), ImmutableList.of("TABLE0", "TaBle1", "table2")).scan();
+    assertThat(ddl.allTables(), hasSize(3));
+    assertThat(ddl.prettyPrint(), equalToCompressingWhiteSpace(String.join("", statements)));
+
+
+    ddl = new InformationSchemaScanner(getTransaction(), ImmutableList.of("NOT_A_TABLE_NAME"))
+        .scan();
+    assertThat(ddl.allTables(), hasSize(0));
+  }
+
+  @Test
+  public void tableFilterInterleavedIn() throws Exception {
+    List<String> statements =
+        Arrays.asList(
+            " CREATE TABLE lEVEl0 ("
+                + " id0                                   INT64 NOT NULL,"
+                + " val0                                  STRING(MAX),"
+                + " ) PRIMARY KEY (id0 ASC)",
+            " CREATE TABLE level1 ("
+                + " id0                                   INT64 NOT NULL,"
+                + " id1                                   INT64 NOT NULL,"
+                + " val1                                  STRING(MAX),"
+                + " ) PRIMARY KEY (id0 ASC, id1 ASC), INTERLEAVE IN PARENT lEVEl0",
+            " CREATE TABLE level2 ("
+                + " id0                                   INT64 NOT NULL,"
+                + " id1                                   INT64 NOT NULL,"
+                + " id2                                   INT64 NOT NULL,"
+                + " val2                                  STRING(MAX),"
+                + " ) PRIMARY KEY (id0 ASC, id1 ASC, id2 ASC), INTERLEAVE IN PARENT level1",
+            " CREATE TABLE level2_1 ("
+                + " id0                                   INT64 NOT NULL,"
+                + " id1                                   INT64 NOT NULL,"
+                + " id2_1                                 INT64 NOT NULL,"
+                + " val2                                  STRING(MAX),"
+                + " ) PRIMARY KEY (id0 ASC, id1 ASC, id2_1 ASC),"
+                + " INTERLEAVE IN PARENT level1 ON DELETE CASCADE",
+            " CREATE INDEX level2_val2 on level2(id0,id1, val2), interleave in level1");
+
+    spannerServer.createDatabase(dbId, statements);
+
+    // only filtering level2 should promote it to root.
+    Ddl ddl = new InformationSchemaScanner(getTransaction(), ImmutableList.of("level2")).scan();
+
+    assertThat(ddl.allTables(), hasSize(1));
+    HashMultimap<Integer, String> levels = ddl.perLevelView();
+    assertThat(levels.get(0), hasSize(1));
+    assertThat(levels.get(1), hasSize(0));
+    assertThat(levels.get(2), hasSize(0));
+    assertThat(levels.get(3), hasSize(0));
+    assertThat(levels.get(4), hasSize(0));
+    assertThat(levels.get(5), hasSize(0));
+    assertThat(levels.get(6), hasSize(0));
+    assertThat(levels.get(7), hasSize(0));
+
+    assertThat(ddl.table("level2").interleaveInParent(), nullValue());
+    // level2's index should now be at the root, as level1 does not exist.
+    assertThat(ddl.table("level2").indexes().get(0), not(containsStringIgnoringCase("INTERLEAVE IN level1")));
+
+    // Level1 should be promoted to root, level 2 stays interleaved in 1
+    ddl = new InformationSchemaScanner(getTransaction(), ImmutableList.of("level1", "level2"))
+        .scan();
+
+    assertThat(ddl.allTables(), hasSize(2));
+    levels = ddl.perLevelView();
+    assertThat(levels.get(0), hasSize(1));
+    assertThat(levels.get(1), hasSize(1));
+    assertThat(levels.get(2), hasSize(0));
+    assertThat(levels.get(3), hasSize(0));
+    assertThat(levels.get(4), hasSize(0));
+    assertThat(levels.get(5), hasSize(0));
+    assertThat(levels.get(6), hasSize(0));
+    assertThat(levels.get(7), hasSize(0));
+
+    assertThat(ddl.table("level1").interleaveInParent(), nullValue());
+    assertThat(ddl.table("level2").interleaveInParent(), equalTo("level1"));
+    assertThat(ddl.table("level2").indexes().get(0), containsString("INTERLEAVE IN level1"));
+  }
+
+  @Test
+  public void tableFilterForeignKeys() throws Exception {
+    List<String> statements =
+        Arrays.asList(
+            " CREATE TABLE `Table0` ("
+                + " `id0`                                   INT64 NOT NULL,"
+                + " `val0`                                  STRING(MAX),"
+                + " ) PRIMARY KEY (`id0` ASC)",
+            " CREATE TABLE `Table1` ("
+                + " `id0`                                   INT64 NOT NULL,"
+                + " `id1`                                   INT64 NOT NULL,"
+                + " `val0`                                  STRING(MAX),"
+                + " ) PRIMARY KEY (`id0` ASC)",
+            " ALTER TABLE `Table1` ADD CONSTRAINT `FK_table1_id1_table0_id0`"
+                + " FOREIGN KEY (`id1`) REFERENCES `Table0` (`id0`)");
+
+    spannerServer.createDatabase(dbId, statements);
+
+    // no table0 so no foreign key
+    Ddl ddl = new InformationSchemaScanner(getTransaction(), ImmutableList.of("Table1"))
+        .scan();
+    assertThat(ddl.allTables(), hasSize(1));
+    assertThat(ddl.table("table1"), notNullValue());
+    assertThat(ddl.table("table1").foreignKeys(), empty());
+    assertThat(ddl.prettyPrint(), equalToCompressingWhiteSpace(statements.get(1))); // just table1
+
+    ddl = new InformationSchemaScanner(getTransaction(), ImmutableList.of("Table0", "Table1"))
+        .scan();
+    assertThat(ddl.allTables(), hasSize(2));
+    assertThat(ddl.table("table1").foreignKeys().get(0),
+        containsString("FK_table1_id1_table0_id0"));
+    assertThat(ddl.prettyPrint(), equalToCompressingWhiteSpace(String.join("", statements)));
+
   }
 }
